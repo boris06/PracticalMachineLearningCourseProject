@@ -1,0 +1,226 @@
+---
+title: "Practical Machine Learning Course Project"
+output: 
+        html_document:
+                keep_md: true
+---
+
+### Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+### Data 
+
+The training data for this project are available here: 
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here: 
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har.
+
+Reference:
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf
+
+### Goal of the project
+
+The goal of the project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set. We may use any of the other variables to predict with. We should create a report describing how we built our model, how we used cross validation, what we think the expected out of sample error is, and why we made the choices we did. We will also use our prediction model to predict 20 different test cases.
+
+### Initializing libraries and options
+
+```{r global_options, warning=FALSE, message=FALSE}
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE)
+knitr::opts_chunk$set(warning=FALSE)
+knitr::opts_chunk$set(message=FALSE)
+library(caret)
+library(rattle)
+library(party)
+library(gbm)
+```
+
+### Getting and cleaning the data
+
+We downloaded the training and testing data from the above websites only to the main memory. Due to problems caused by access to "https" websites, we use the solution from http://stackoverflow.com/questions/28997402/r-read-csv-from-url-error-in-knitr. At the same time we ensure that the data which we read will not be factors. 
+
+```{r data, cache=TRUE, message=FALSE}
+library(RCurl)
+data <- getURL("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",ssl.verifypeer=0L, followlocation=1L)
+training <- read.csv(text=data, stringsAsFactors=FALSE)
+data <- getURL("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",ssl.verifypeer=0L, followlocation=1L)
+testing <- read.csv(text=data, stringsAsFactors=FALSE)
+dateDownloaded <- date()
+dateDownloaded
+```
+
+First we look into the structure of the data:
+
+```{r results='hide'}
+str(training)
+str(testing)
+```
+
+We have `r dim(training)[1]` observations and `r dim(training)[2]` variables in the *training* dataset and `r dim(testing)[1]` observations and `r dim(testing)[2]` variables in the *testing* dataset. There are a plenty of *NA's* in both datasets, so we eliminate the variables with too high proportion of *NA's*. We also eliminate first seven variables (`r colnames(training[,c(1:7)])`), which are not useful for the prediction.
+
+```{r}
+training <- training[,-c(1:7)]
+missing <- apply(training, 2, function(x) {round(mean(is.na(x)),2)})
+table(missing)
+```
+
+We have 86 variables without missing values and 67 variables with 98% of missing values, so we use only the former:
+
+```{r}
+training <- training[,missing==0]
+```
+
+Next we check for the variables with near zero variance and eliminate them:
+
+```{r}
+trainNZV <- nearZeroVar(training, saveMetrics = TRUE)
+trainNZV <- trainNZV[trainNZV$nzv == FALSE,]
+training <- training[, rownames(trainNZV)]
+```
+
+Now we have left with `r dim(training)[2]` of useful variables, including the variable *classe*, which we predict:
+
+```{r}
+colnames(training)
+```
+
+We prepare the testing dataset in the same manner, excluding the variable *classe* which is not present in the testing dataset. Finally, we check if they are any *NA's* in the testing dataset.
+
+```{r}
+testing <- testing[, colnames(training)[colnames(training) != "classe"]]
+sum(is.na(testing))
+```
+
+Therefore, the *testing* dataset is free of *NA* values. The variables are of type *integer* or decimal (i.e. *num*). We coerce all the integers to num's and convert the variable *classe* into factors. We do this for both, the training dataset and test dataset.
+
+```{r}
+classes <- as.character(sapply(training, class))
+colClasses <- which(classes=="integer")
+training[, colClasses] <- sapply(training[, colClasses], as.numeric)
+training$classe <- as.factor(training$classe)
+
+classes <- as.character(sapply(testing, class))
+colClasses <- which(classes=="integer")
+testing[, colClasses] <- sapply(testing[, colClasses], as.numeric)
+```
+
+Now we split the *training* dataset into *train1* dataset (60% of observations), which will be used for training with various models, and *test1* dataset (40% of observations) for evaluating the predictions:
+
+```{r}
+inTrain <- createDataPartition(y=training$classe,
+                              p=0.6, list=FALSE)
+train1 <- training[inTrain,]
+test1 <- training[-inTrain,]
+dim(train1); dim(test1)
+```
+
+### Predictions with machine learning algorithms
+
+Among the numerous models we choose *classification tree (CART)*, from which we may expect worse results, *bagging with CART*, *random forest* and *boosting*, which will probably give us better results. We will set the train control for the individual models according to the computational capacity of our machine. We give the elapsed time for the training procedure for each of the models used.
+
+#### Classification tree
+
+Fo the classification tree we use default train control parameters, i.e.  bootstrap with 25 repeats:
+
+```{r fig.width=10, fig.height=8.6}
+set.seed(1235)
+ptm <- proc.time()
+modCART <- train(classe ~ .,method="rpart",data=train1)
+proc.time() - ptm
+print(modCART$finalModel)
+fancyRpartPlot(modCART$finalModel)
+predCART <- predict(modCART,newdata=test1)
+confusionMatrix(predCART, test1$classe)
+```
+
+The accuracy of classification tree is very poor here (i.e. `r round(confusionMatrix(predCART, test1$classe)[[3]][[1]],2)`, so we try bagging with 10 trees.
+
+#### Bagging with Classification Trees
+
+```{r}
+set.seed(1235)
+ptm <- proc.time()
+treebag <- bag(train1[,-c(53)], train1$classe, B = 10,
+               bagControl = bagControl(fit = ctreeBag$fit,
+                                       predict = ctreeBag$pred,
+                                       aggregate = ctreeBag$aggregate))
+proc.time() - ptm
+predBAG <- predict(treebag,newdata=test1)
+confusionMatrix(predBAG, test1$classe)
+```
+
+The accuracy of bagging with classification trees is much better (i.e. `r round(confusionMatrix(predBAG, test1$classe)[[3]][[1]],2)`).
+
+#### Random Forest
+
+The algorithm Random Forest runs for a long time, if we use the default parameters. Therefore, we will restrict training to 5-fold cross-validation:
+
+```{r}
+set.seed(1235)
+ptm <- proc.time()
+modRF <- train(classe ~ .,method="rf",data=train1,prox=TRUE,trControl=trainControl(method = "cv", number = 5))
+proc.time() - ptm
+modRF
+predRF <- predict(modRF,test1); 
+test1$predRight <- predRF==test1$classe
+table(predRF,test1$classe,dnn=c("Prediction","Reference"))
+```
+
+```{r echo=FALSE, results='hide'}
+save(modRF, file = "modRF.RData")
+```
+
+The accuracy of random forest is the best (i.e. `r round(confusionMatrix(predRF, test1$classe)[[3]][[1]],2)`).
+
+#### Boosting
+
+Due to limited computational capacity, we also restrict the training to 5-fold cross-validation:
+
+```{r}
+set.seed(1235)
+ptm <- proc.time()
+modBOOST <- train(classe ~ ., method="gbm",data=train1,verbose=FALSE,trControl=trainControl(method = "cv", number = 5))
+proc.time() - ptm
+print(modBOOST)
+predBOOST <- predict(modBOOST,newdata=test1)
+confusionMatrix(predBOOST, test1$classe)
+```
+
+The accuracy of boosting is lower than the accuracy of the random forest (i.e. `r round(confusionMatrix(predBOOST, test1$classe)[[3]][[1]],2)`).
+
+### Conclusion
+
+The table below shows the accuracy of the models used on the dataset *test1* and their prediction on the *testing* dataset. The last three models with very high accuracy give the same predictions on the *testing* dataset, so we take them for the submission of the project.  
+
+```{r}
+accCART <- confusionMatrix(predCART, test1$classe)[[3]][[1]]
+accBAG <- confusionMatrix(predBAG, test1$classe)[[3]][[1]]
+accRF <- confusionMatrix(predRF, test1$classe)[[3]][[1]]
+accBOOST <- confusionMatrix(predBOOST, test1$classe)[[3]][[1]]
+resCART <- paste(as.character(predict(modCART,testing)), collapse="")
+resBAG <- paste(as.character(predict(treebag,testing)), collapse="")
+resRF <- paste(as.character(predict(modRF,testing)), collapse="")
+resBOOST <- paste(as.character(predict(modBOOST,testing)), collapse="")
+print(data.frame(accuracy=c(accCART, accBAG, accRF, accBOOST),
+                 answer=c(resCART,resBAG, resRF,resBOOST),
+                 row.names=c("CART","Bagging with CART","Random Forest",
+                         "Boosting")), digits=3)
+answers <- as.character(predict(modRF,testing))     
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(answers)
+```
+
